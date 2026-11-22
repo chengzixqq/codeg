@@ -2896,7 +2896,7 @@ impl ClaudeRecordAccumulator {
 impl ClaudeParser {
     fn parse_conversation_detail(
         &self,
-        path: &PathBuf,
+        path: &Path,
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
         // Read the file fully up front: `transcript_watermark` must be EXACTLY
@@ -2909,7 +2909,7 @@ impl ClaudeParser {
         detail_cache::open(path)?.read_to_end(&mut bytes)?;
         let transcript_watermark = bytes.len() as u64;
 
-        let mut acc = ClaudeRecordAccumulator::new(path.clone());
+        let mut acc = ClaudeRecordAccumulator::new(path.to_path_buf());
         for chunk in bytes.split(|b| *b == b'\n') {
             // Mirror `BufReader::lines()`: a line that isn't valid UTF-8 is
             // skipped (the old loop's per-line `Err(_) => continue`).
@@ -3853,7 +3853,7 @@ pub(crate) type SubagentTranscript = (
 /// Fork rule: a `subagent_type: "fork"` child's transcript opens with context
 /// it inherited, and everything up to its directive message is dropped from
 /// all five results (see [`is_fork_directive_record`]).
-pub(crate) fn parse_subagent_tool_calls(path: &PathBuf) -> SubagentTranscript {
+pub(crate) fn parse_subagent_tool_calls(path: &Path) -> SubagentTranscript {
     let file = match detail_cache::open(path) {
         Ok(f) => f,
         Err(_) => return (Vec::new(), Vec::new(), None, None, None),
@@ -4748,7 +4748,7 @@ mod tests {
             })
         )
         .unwrap();
-        let (calls, _, _, _, _) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (calls, _, _, _, _) = parse_subagent_tool_calls(file.path());
         let input: serde_json::Value =
             serde_json::from_str(calls[0].input_preview.as_deref().unwrap()).unwrap();
         assert_eq!(
@@ -4903,7 +4903,7 @@ mod tests {
         {
             writeln!(file, "{line}").unwrap();
         }
-        let (calls, _, _, _, _) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (calls, _, _, _, _) = parse_subagent_tool_calls(file.path());
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].tool_name, "advisor");
         assert_eq!(
@@ -4972,7 +4972,7 @@ mod tests {
         ] {
             writeln!(file, "{line}").unwrap();
         }
-        let (calls, timeline, _, _, _) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (calls, timeline, _, _, _) = parse_subagent_tool_calls(file.path());
 
         assert_eq!(calls.len(), 2);
         let kinds: Vec<(&str, Option<usize>, Option<&str>)> = timeline
@@ -5011,7 +5011,7 @@ mod tests {
             }))
         )
         .unwrap();
-        let (_, timeline, _, _, _) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (_, timeline, _, _, _) = parse_subagent_tool_calls(file.path());
         assert_eq!(timeline.len(), 1);
         // `truncate_str` appends "..." past the cap.
         let text = timeline[0].text.as_deref().unwrap();
@@ -5022,7 +5022,7 @@ mod tests {
     #[test]
     fn an_empty_subagent_transcript_yields_no_calls_and_no_timeline() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let (calls, timeline, usage, _, _) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (calls, timeline, usage, _, _) = parse_subagent_tool_calls(file.path());
         assert!(calls.is_empty());
         assert!(timeline.is_empty());
         assert!(usage.is_none());
@@ -5046,7 +5046,7 @@ mod tests {
         ] {
             writeln!(file, "{line}").unwrap();
         }
-        let (_, _, _, _, duration_ms) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (_, _, _, _, duration_ms) = parse_subagent_tool_calls(file.path());
         assert_eq!(duration_ms, Some(2_500));
     }
 
@@ -5062,7 +5062,7 @@ mod tests {
             )
         )
         .unwrap();
-        let (_, _, _, _, duration_ms) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (_, _, _, _, duration_ms) = parse_subagent_tool_calls(file.path());
         assert_eq!(duration_ms, None);
     }
 
@@ -5089,7 +5089,7 @@ mod tests {
         ] {
             writeln!(file, "{line}").unwrap();
         }
-        let (_, _, _, _, duration_ms) = parse_subagent_tool_calls(&file.path().to_path_buf());
+        let (_, _, _, _, duration_ms) = parse_subagent_tool_calls(file.path());
         assert_eq!(duration_ms, None);
     }
 
@@ -5138,7 +5138,7 @@ mod tests {
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
-        parse_subagent_tool_calls(&file.path().to_path_buf())
+        parse_subagent_tool_calls(file.path())
     }
 
     fn input_usage(tokens: u64) -> serde_json::Value {
