@@ -1,19 +1,9 @@
 //! Turn-window slicing for conversation detail responses.
 //!
-//! The parsers always parse a session transcript in full (local parsing is
-//! fast); what hurts web / remote-workspace mode is *transferring* every turn
-//! of a long conversation on each detail fetch. These helpers slice the fully
-//! parsed + fully post-processed turn list down to a requested window right
-//! before serialization, plus compute the window metadata the frontend's
-//! consistency protocol needs (offset/total, assistant count before the
-//! window, a structural prefix fingerprint, and the max timestamp of the
-//! uncovered prefix).
-//!
-//! Invariant shared with `get_folder_conversation_core`: every existing
-//! post-processing pass (delegation-meta injection, auto-title, in-flight id
-//! stamping) runs on the FULL turn list first; slicing is strictly a
-//! serialization concern, so a windowed response is byte-identical to the
-//! corresponding region of the full response.
+//! Windows are selected from a full parser snapshot. Offsets, prefix
+//! fingerprints, cross-turn delegation matches, and live prompt correlation
+//! are all computed against that same history. The response materializes only
+//! the requested turns, with the same metadata as the full response.
 //!
 //! The message navigator needs one thing a window can't give it: an index of
 //! EVERY user message, including the ones above the loaded window. Its
