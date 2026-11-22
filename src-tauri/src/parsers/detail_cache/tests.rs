@@ -120,6 +120,128 @@ fn claude_sees_atomic_replacement_with_preserved_size_and_mtime() {
 }
 
 #[test]
+fn claude_keeps_the_parent_parse_while_other_project_sessions_write() {
+    use std::io::Write;
+    let h = History::new(AgentType::ClaudeCode);
+    let parent = h.claude("parent");
+    write(
+        &parent,
+        &[user(&"long history ".repeat(8192)), assistant("done", 5)],
+    );
+    let child = parent
+        .with_extension("")
+        .join("subagents/agent-worker.jsonl");
+    write(&child, &[assistant("worker", 17)]);
+    let sibling = h.claude("parallel-session");
+    write(&sibling, &[user("independent conversation")]);
+    let before = h.get("parent");
+    assert!(text_in(&before, "done"));
+    for i in 0..3 {
+        let mut file = fs::OpenOptions::new().append(true).open(&sibling).unwrap();
+        writeln!(file, "\n{}", assistant("still working", i)).unwrap();
+        assert!(Arc::ptr_eq(&before, &h.get("parent")), "sibling append {i}");
+        write(&h.claude(&format!("other-{i}")), &[user("another session")]);
+        assert!(Arc::ptr_eq(&before, &h.get("parent")), "new sibling {i}");
+    }
+    write(&child, &[assistant("worker", 23)]);
+    let updated = h.get("parent");
+    assert!(!Arc::ptr_eq(&before, &updated));
+    assert_eq!(
+        updated
+            .turns
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(|u| u.input_tokens)
+            .sum::<u64>(),
+        28
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn claude_probes_only_the_head_of_a_recent_unrelated_transcript() {
+    // Linux accounts read(2) bytes per thread, including reads served by the
+    // page cache. A full SHA pass over the sibling alone exceeds this budget.
+    fn bytes_read() -> u64 {
+        fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let h = History::new(AgentType::ClaudeCode);
+    write(&h.claude("parent"), &[user(&"main".repeat(1024))]);
+    let sibling = h.claude("busy");
+    write(&sibling, &vec![user("unrelated"); 48]);
+    fs::File::options()
+        .write(true)
+        .open(&sibling)
+        .unwrap()
+        .set_len(4 * 1024 * 1024)
+        .unwrap();
+    let before = bytes_read();
+    let detail = h.get("parent");
+    assert_eq!(detail.summary.id, "parent");
+    assert!(
+        bytes_read() - before < 1024 * 1024,
+        "read the unrelated transcript body"
+    );
+
+    // Let real ctimes leave the racy-stat window, then prime the settled probes.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(Arc::ptr_eq(&detail, &h.get("parent")));
+    let before = bytes_read();
+    assert!(Arc::ptr_eq(&detail, &h.get("parent")));
+    assert!(bytes_read() - before < 1024, "re-read a settled transcript");
+}
+
+#[test]
+fn claude_retries_an_incomplete_rollover_query() {
+    let h = History::new(AgentType::ClaudeCode);
+    write(&h.claude("parent"), &[user("original")]);
+    let parent = h.get("parent");
+    let next = h.claude("next");
+    fs::create_dir(&next).unwrap(); // An entry that cannot be read as JSONL.
+    let partial = h.get("parent");
+    assert!(text_in(&partial, "original"));
+    assert!(!Arc::ptr_eq(&parent, &partial));
+    assert!(!Arc::ptr_eq(&partial, &h.get("parent")));
+    fs::remove_dir(&next).unwrap();
+    write(&next, &[user("<command-name>/clear</command-name>")]);
+    assert_eq!(h.get("parent").summary.id, "next");
+}
+
+#[test]
+fn claude_reselects_a_sibling_rewritten_as_a_clear_with_preserved_mtime() {
+    let h = History::new(AgentType::ClaudeCode);
+    write(&h.claude("parent"), &[user("parent conversation")]);
+    let sibling = h.claude("candidate");
+    let records = |cmd| {
+        [
+            user(&format!("<command-name>/{cmd}</command-name>")),
+            assistant("sibling reply", 2),
+        ]
+    };
+    write(&sibling, &records("model"));
+    let mtime = fs::metadata(&sibling).unwrap().modified().unwrap();
+    let old = h.get("parent");
+    write(&sibling, &records("clear"));
+    fs::File::options()
+        .write(true)
+        .open(&sibling)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let rolled = h.get("parent");
+    assert!(!Arc::ptr_eq(&old, &rolled));
+    assert_eq!(rolled.summary.id, "candidate");
+    assert!(text_in(&rolled, "sibling reply"));
+    assert!(Arc::ptr_eq(&rolled, &h.get("parent")));
+}
+
+#[test]
 fn claude_child_usage_and_rollover_revalidate_the_parent() {
     let h = History::new(AgentType::ClaudeCode);
     let path = h.claude("parent");

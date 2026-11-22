@@ -1,12 +1,12 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 
-use super::detail_cache;
+use super::detail_cache::{self, ProbeEnd, RolloverProbes};
 use crate::models::*;
 use crate::parsers::{
     folder_name_from_path, is_safe_subagent_id, title_from_user_text, truncate_str, AgentEnv,
@@ -1317,8 +1317,20 @@ pub(crate) fn find_clear_rollover_successor(
     current_file: &Path,
     current_session_id: &str,
 ) -> Option<(String, PathBuf)> {
+    rollover_successor(current_file, current_session_id, &mut Default::default())
+}
+
+/// Metadata shortcuts are optional. A failed lookup still gives the watcher
+/// and the uncached parser their usual best-effort result.
+fn rollover_successor(
+    current_file: &Path,
+    current_session_id: &str,
+    probes: &mut RolloverProbes,
+) -> Option<(String, PathBuf)> {
     let dir = current_file.parent()?;
-    let current_last = last_record_timestamp(current_file)?;
+    let current_last = probes.read(current_file, ProbeEnd::Tail, |file, _| {
+        last_record_timestamp(file)
+    })?;
     // Earliest a successor may have been written. A file whose LAST write
     // predates it cannot hold a `/clear` record at/after `current_last`, so
     // the stat alone rules it out — worth doing, because a busy project dir
@@ -1328,7 +1340,11 @@ pub(crate) fn find_clear_rollover_successor(
         current_last - chrono::Duration::seconds(CLEAR_ROLLOVER_BACK_TOLERANCE_SECS),
     );
     let mut best: Option<(DateTime<Utc>, String, PathBuf)> = None;
-    for entry in detail_cache::read_dir(dir).ok()?.flatten() {
+    let entries = probes.checked(fs::read_dir(dir))?;
+    for entry in entries {
+        let Some(entry) = probes.checked(entry) else {
+            continue;
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
@@ -1342,24 +1358,11 @@ pub(crate) fn find_clear_rollover_successor(
         if stem == current_session_id || !is_safe_subagent_id(stem) {
             continue;
         }
-        detail_cache::observe(&path);
-        let too_old = entry
-            .metadata()
-            .inspect(|meta| {
-                // DirEntry uses the link mtime for this cutoff. The other inputs
-                // use the target, so a link candidate needs a fresh rollover scan.
-                if meta.is_symlink() {
-                    detail_cache::unversioned();
-                }
-            })
-            .inspect_err(detail_cache::io_error)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .is_some_and(|m| m < earliest_write);
-        if too_old {
+        let modified = probes.checked(entry.metadata().and_then(|meta| meta.modified()));
+        if modified.is_some_and(|m| m < earliest_write) {
             continue;
         }
-        let Some(started) = clear_rollover_started_at(&path) else {
+        let Some(started) = probes.read(&path, ProbeEnd::Head, clear_rollover_started_at) else {
             continue;
         };
         // The successor's `/clear` record lands within MILLISECONDS of the
@@ -1388,14 +1391,15 @@ pub(crate) fn find_clear_rollover_successor(
 
 /// Follow `/clear` rollovers until the latest transcript. Caps the chain so a
 /// corrupt directory cannot loop. Identity when there is no successor.
-pub(crate) fn follow_clear_rollover_chain(
+pub(super) fn follow_clear_rollover_chain(
     current_file: &Path,
     current_session_id: &str,
+    probes: &mut RolloverProbes,
 ) -> (String, PathBuf) {
     let mut id = current_session_id.to_string();
     let mut path = current_file.to_path_buf();
     for _ in 0..CLEAR_ROLLOVER_CHAIN_LIMIT {
-        match find_clear_rollover_successor(&path, &id) {
+        match rollover_successor(&path, &id, probes) {
             Some((next_id, next_path)) => {
                 id = next_id;
                 path = next_path;
@@ -1466,41 +1470,39 @@ fn record_is_clear_command(value: &serde_json::Value) -> bool {
 }
 
 /// Timestamp of the `/clear` record at the head of a rollover file, if any.
-fn clear_rollover_started_at(path: &Path) -> Option<DateTime<Utc>> {
-    let file = detail_cache::open(path).ok()?;
+fn clear_rollover_started_at(
+    file: &mut fs::File,
+    probes: &mut RolloverProbes,
+) -> io::Result<Option<DateTime<Utc>>> {
     let reader = BufReader::new(file);
-    for (i, line) in reader.lines().enumerate() {
-        if i >= CLEAR_ROLLOVER_PEEK_LINES {
-            break;
-        }
-        let Ok(line) = line.inspect_err(detail_cache::io_error) else {
+    for line in reader.lines().take(CLEAR_ROLLOVER_PEEK_LINES) {
+        let Some(line) = probes.checked(line) else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if record_is_clear_command(&value) {
-            return record_timestamp(&value);
+            return Ok(record_timestamp(&value));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Last JSONL record timestamp, read from a trailing window so a large
 /// transcript is not fully scanned on every watcher tick.
-fn last_record_timestamp(path: &Path) -> Option<DateTime<Utc>> {
-    let mut file = detail_cache::open(path).ok()?;
-    let meta = file.metadata().inspect_err(detail_cache::io_error).ok()?;
+fn last_record_timestamp(file: &mut fs::File) -> io::Result<Option<DateTime<Utc>>> {
+    let meta = file.metadata()?;
     let len = meta.len();
     let start = len.saturating_sub(64 * 1024);
-    file.seek(SeekFrom::Start(start)).inspect_err(detail_cache::io_error).ok()?;
+    file.seek(SeekFrom::Start(start))?;
     // Bytes, not `read_to_string`: the window starts at a fixed offset, which
     // lands mid-codepoint on any transcript whose tail holds non-ASCII text.
     // `read_to_string` fails outright there (`InvalidData`), which would take
     // the whole detector out on exactly the transcripts most likely to need
     // it. The first partial line is dropped below anyway.
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).inspect_err(detail_cache::io_error).ok()?;
+    file.take(len - start).read_to_end(&mut bytes)?;
     let buf = String::from_utf8_lossy(&bytes);
     let text = if start > 0 {
         buf.split_once('\n').map(|(_, rest)| rest).unwrap_or(&buf)
@@ -1523,7 +1525,10 @@ fn last_record_timestamp(path: &Path) -> Option<DateTime<Utc>> {
     // than the window; a metadata-only tail — `ai-title`/`mode`/`atis-latch`
     // carry no timestamp) must not disable the search: fall back to the file's
     // own mtime, which is the same quantity to within a write.
-    last.or_else(|| meta.modified().ok().map(DateTime::<Utc>::from))
+    match last {
+        Some(ts) => Ok(Some(ts)),
+        None => Ok(Some(meta.modified()?.into())),
+    }
 }
 
 impl ClaudeParser {
@@ -1793,7 +1798,7 @@ impl AgentParser for ClaudeParser {
                 // `/clear` leaves the old file in place and writes a sibling
                 // uuid. Follow that chain so reopen shows post-clear turns.
                 let (resolved_id, resolved_path) =
-                    follow_clear_rollover_chain(&file_path, conversation_id);
+                    detail_cache::select_claude_rollover(&file_path, conversation_id);
                 return self.parse_conversation_detail(&resolved_path, &resolved_id);
             }
         }

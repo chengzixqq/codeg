@@ -4,6 +4,7 @@
 //! their I/O without giving the other parser and watcher callers a cache API.
 
 use super::{claude, codex, AgentType, Key};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -12,9 +13,10 @@ use std::io::{self, Read};
 use std::mem::{size_of, size_of_val};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Stamp {
     Missing,
     Present {
@@ -150,8 +152,7 @@ impl Stamp {
         };
         let mut hash = Sha256::new();
         if *is_dir {
-            // Preserve enumeration order: equal-timestamp rollover candidates
-            // are resolved in that order.
+            // Keep directory enumeration order as well as membership.
             for entry in fs::read_dir(path).ok()? {
                 let name = entry.ok()?.file_name();
                 let bytes = name.as_encoded_bytes();
@@ -208,8 +209,83 @@ impl Fingerprint {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub(in crate::parsers) enum ProbeEnd {
+    Head,
+    Tail,
+}
+
+// A settled stamp includes the device, file identity, mtime and change time.
+// The same head/tail answer can therefore serve every session in the project.
+// Keys own no paths or transcript bytes. Bound this optional metadata cache
+// independently of the much larger parsed details.
+type ProbeKey = (Stamp, ProbeEnd);
+static PROBES: Mutex<BTreeMap<ProbeKey, Option<DateTime<Utc>>>> = Mutex::new(BTreeMap::new());
+const MAX_PROBES: usize = 8192;
+
+#[derive(Default)]
+pub(in crate::parsers) struct RolloverProbes {
+    memoize: bool,
+    incomplete: bool,
+}
+
+impl RolloverProbes {
+    pub(in crate::parsers) fn checked<T>(&mut self, result: io::Result<T>) -> Option<T> {
+        result.inspect_err(|_| self.incomplete = true).ok()
+    }
+
+    pub(in crate::parsers) fn read(
+        &mut self,
+        path: &Path,
+        end: ProbeEnd,
+        query: impl FnOnce(&mut File, &mut Self) -> io::Result<Option<DateTime<Utc>>>,
+    ) -> Option<DateTime<Utc>> {
+        // A recent stamp can denote several same-size writes in one clock tick.
+        // Re-run just the bounded semantic query until a settled read is possible.
+        let key = if self.memoize {
+            stamp(path)
+                .filter(|s| {
+                    matches!(s, Stamp::Present { is_dir: false, .. }) && !s.recently_changed()
+                })
+                .map(|s| (s, end))
+        } else {
+            None
+        };
+        if let Some(key) = &key {
+            if let Some(result) = PROBES.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
+                return *result;
+            }
+        }
+        let mut file = self.checked(File::open(path))?;
+        let result = query(&mut file, self);
+        let result = self.checked(result)?;
+        if let Some(key) =
+            key.filter(|(stamp, _)| !self.incomplete && stamp_file(&file).as_ref() == Some(stamp))
+        {
+            let mut saved = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+            if saved.len() >= MAX_PROBES {
+                saved.clear();
+            }
+            saved.insert(key, result);
+        }
+        result
+    }
+}
+
+pub(in crate::parsers) fn select_claude_rollover(path: &Path, id: &str) -> (String, PathBuf) {
+    let mut probes = RolloverProbes::default();
+    recording(|_| probes.memoize = true);
+    let selected = claude::follow_clear_rollover_chain(path, id, &mut probes);
+    recording(|r| {
+        r.invalid |= probes.incomplete;
+        r.rollover = Some(selected.1.clone());
+    });
+    selected
+}
+
 #[derive(Default)]
 struct Recorder {
+    rollover: Option<PathBuf>,
     main: Option<PathBuf>,
     inherited: BTreeMap<String, Option<PathBuf>>,
     paths: BTreeMap<PathBuf, Fingerprint>,
@@ -245,6 +321,7 @@ pub(super) fn record<T>(parse: impl FnOnce() -> T) -> (T, Option<Version>) {
         .filter(|_| !recorder.invalid)
         .map(|main| Version {
             main,
+            rollover: recorder.rollover,
             inherited: recorder.inherited.into_iter().collect(),
             paths: recorder.paths.into_iter().collect(),
         });
@@ -343,6 +420,7 @@ pub(in crate::parsers) fn read_dir(
 }
 
 pub(super) struct Version {
+    rollover: Option<PathBuf>,
     main: PathBuf,
     inherited: Box<[(String, Option<PathBuf>)]>,
     paths: Box<[(PathBuf, Fingerprint)]>,
@@ -369,10 +447,20 @@ impl Version {
         };
         main.as_ref() == Some(&self.main)
             && self.paths.iter().all(|(path, token)| token.matches(path))
+            && self.rollover.as_ref().is_none_or(|expected| {
+                let mut probes = RolloverProbes {
+                    memoize: true,
+                    incomplete: false,
+                };
+                let (_, selected) =
+                    claude::follow_clear_rollover_chain(&self.main, &key.id, &mut probes);
+                !probes.incomplete && selected == *expected
+            })
     }
 
     pub(super) fn bytes(&self) -> u64 {
         size_of::<Self>() as u64
+            + self.rollover.as_ref().map_or(0, PathBuf::capacity) as u64
             + self.main.capacity() as u64
             + size_of_val(&*self.paths) as u64
             + size_of_val(&*self.inherited) as u64

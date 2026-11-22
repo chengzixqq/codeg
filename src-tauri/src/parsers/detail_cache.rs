@@ -14,8 +14,8 @@ use super::{build_agent_parser, claude, codex, AgentEnv, ParseError};
 use crate::models::{AgentType, ConversationDetail};
 
 pub(super) use sources::{
-    io_error, observe, open, read_dir, selected_inherited, selected_main, unversioned,
-    unversioned_now,
+    io_error, observe, open, read_dir, select_claude_rollover, selected_inherited, selected_main,
+    unversioned_now, ProbeEnd, RolloverProbes,
 };
 
 const CACHE_BYTES: u64 = 128 * 1024 * 1024;
