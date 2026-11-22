@@ -428,6 +428,10 @@ pub(super) struct Version {
 
 impl Version {
     pub(super) fn current(&self, key: &Key) -> bool {
+        // A changed transcript can reject a hit without a session-directory walk.
+        if !self.paths.iter().all(|(path, token)| token.matches(path)) {
+            return false;
+        }
         // Repeat the parser's filename selection: a new rollout can supersede
         // the main file or satisfy a history pointer anywhere in sessions/.
         let main = match key.agent {
@@ -446,7 +450,6 @@ impl Version {
             _ => return false,
         };
         main.as_ref() == Some(&self.main)
-            && self.paths.iter().all(|(path, token)| token.matches(path))
             && self.rollover.as_ref().is_none_or(|expected| {
                 let mut probes = RolloverProbes {
                     memoize: true,
