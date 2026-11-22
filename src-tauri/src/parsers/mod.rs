@@ -11,6 +11,8 @@ mod codex_async_questions;
 mod codex_file_citations;
 pub mod cursor;
 pub mod deepseek;
+mod detail_cache;
+pub(crate) use detail_cache::shared_conversation_detail;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
@@ -1649,18 +1651,20 @@ pub fn resolve_patch_text(patch: &str, cwd: Option<&str>) -> Option<String> {
 
 /// Load file lines from disk, trying both absolute path and cwd-relative.
 pub fn load_file_lines(path: &str, cwd: Option<&str>) -> Option<Vec<String>> {
-    use std::fs;
     use std::path::Path;
 
+    let read = |path: &Path| {
+        std::io::read_to_string(detail_cache::open(path)?).inspect_err(detail_cache::io_error)
+    };
     let p = Path::new(path);
     if p.is_absolute() {
-        if let Ok(content) = fs::read_to_string(p) {
+        if let Ok(content) = read(p) {
             return Some(content.lines().map(|l| l.to_string()).collect());
         }
     }
     if let Some(base) = cwd {
         let full = Path::new(base).join(path);
-        if let Ok(content) = fs::read_to_string(&full) {
+        if let Ok(content) = read(&full) {
             return Some(content.lines().map(|l| l.to_string()).collect());
         }
     }

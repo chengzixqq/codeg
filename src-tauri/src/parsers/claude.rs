@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 
+use super::detail_cache;
 use crate::models::*;
 use crate::parsers::{
     folder_name_from_path, is_safe_subagent_id, title_from_user_text, truncate_str, AgentEnv,
@@ -1327,7 +1328,7 @@ pub(crate) fn find_clear_rollover_successor(
         current_last - chrono::Duration::seconds(CLEAR_ROLLOVER_BACK_TOLERANCE_SECS),
     );
     let mut best: Option<(DateTime<Utc>, String, PathBuf)> = None;
-    for entry in fs::read_dir(dir).ok()?.flatten() {
+    for entry in detail_cache::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
@@ -1341,8 +1342,17 @@ pub(crate) fn find_clear_rollover_successor(
         if stem == current_session_id || !is_safe_subagent_id(stem) {
             continue;
         }
+        detail_cache::observe(&path);
         let too_old = entry
             .metadata()
+            .inspect(|meta| {
+                // DirEntry uses the link mtime for this cutoff. The other inputs
+                // use the target, so a link candidate needs a fresh rollover scan.
+                if meta.is_symlink() {
+                    detail_cache::unversioned();
+                }
+            })
+            .inspect_err(detail_cache::io_error)
             .ok()
             .and_then(|m| m.modified().ok())
             .is_some_and(|m| m < earliest_write);
@@ -1457,13 +1467,13 @@ fn record_is_clear_command(value: &serde_json::Value) -> bool {
 
 /// Timestamp of the `/clear` record at the head of a rollover file, if any.
 fn clear_rollover_started_at(path: &Path) -> Option<DateTime<Utc>> {
-    let file = fs::File::open(path).ok()?;
+    let file = detail_cache::open(path).ok()?;
     let reader = BufReader::new(file);
     for (i, line) in reader.lines().enumerate() {
         if i >= CLEAR_ROLLOVER_PEEK_LINES {
             break;
         }
-        let Ok(line) = line else {
+        let Ok(line) = line.inspect_err(detail_cache::io_error) else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -1479,18 +1489,18 @@ fn clear_rollover_started_at(path: &Path) -> Option<DateTime<Utc>> {
 /// Last JSONL record timestamp, read from a trailing window so a large
 /// transcript is not fully scanned on every watcher tick.
 fn last_record_timestamp(path: &Path) -> Option<DateTime<Utc>> {
-    let mut file = fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
+    let mut file = detail_cache::open(path).ok()?;
+    let meta = file.metadata().inspect_err(detail_cache::io_error).ok()?;
     let len = meta.len();
     let start = len.saturating_sub(64 * 1024);
-    file.seek(SeekFrom::Start(start)).ok()?;
+    file.seek(SeekFrom::Start(start)).inspect_err(detail_cache::io_error).ok()?;
     // Bytes, not `read_to_string`: the window starts at a fixed offset, which
     // lands mid-codepoint on any transcript whose tail holds non-ASCII text.
     // `read_to_string` fails outright there (`InvalidData`), which would take
     // the whole detector out on exactly the transcripts most likely to need
     // it. The first partial line is dropped below anyway.
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
+    file.read_to_end(&mut bytes).inspect_err(detail_cache::io_error).ok()?;
     let buf = String::from_utf8_lossy(&bytes);
     let text = if start > 0 {
         buf.split_once('\n').map(|(_, rest)| rest).unwrap_or(&buf)
@@ -1779,6 +1789,7 @@ impl AgentParser for ClaudeParser {
 
             let file_path = project_dir.join(format!("{}.jsonl", conversation_id));
             if file_path.exists() {
+                detail_cache::selected_main(&file_path);
                 // `/clear` leaves the old file in place and writes a sibling
                 // uuid. Follow that chain so reopen shows post-clear turns.
                 let (resolved_id, resolved_path) =
@@ -2129,7 +2140,7 @@ impl ClaudeRecordAccumulator {
         // would otherwise vanish and make adjacent assistant turns look merged.
         if msg_type == "user" {
             if let Some((display, prompt_id)) = slash_command_value_display(&value) {
-                let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                 let uuid = value
                     .get("uuid")
                     .and_then(|u| u.as_str())
@@ -2219,7 +2230,7 @@ impl ClaudeRecordAccumulator {
                 *pending_assistant_message_id = None;
                 if let Some(failure) = api_error_text(&value).and_then(|text| {
                     let uuid = value.get("uuid").and_then(|u| u.as_str()).unwrap_or("");
-                    let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                    let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                     super::turn_error_message(uuid.to_string(), &text, timestamp)
                 }) {
                     messages.push(failure);
@@ -2249,7 +2260,7 @@ impl ClaudeRecordAccumulator {
                     return;
                 }
 
-                let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                 let uuid = value
                     .get("uuid")
                     .and_then(|u| u.as_str())
@@ -2344,6 +2355,7 @@ impl ClaudeRecordAccumulator {
                                 let subagent_dir = path.with_extension("").join("subagents");
                                 let subagent_path =
                                     subagent_dir.join(format!("agent-{}.jsonl", agent_id));
+                                detail_cache::observe(&subagent_path);
                                 if subagent_path.exists() {
                                     let (calls, timeline, _, _, duration_ms) =
                                         parse_subagent_tool_calls(&subagent_path);
@@ -2389,7 +2401,7 @@ impl ClaudeRecordAccumulator {
                 // message it is about to push by `messages.len()`.
                 release_pending_goal(messages, pending_goal_open, open_goal);
 
-                let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                 let uuid = value
                     .get("uuid")
                     .and_then(|u| u.as_str())
@@ -2495,7 +2507,7 @@ impl ClaudeRecordAccumulator {
                     if title.is_none() {
                         *title = title_from_user_blocks(&content);
                     }
-                    let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                    let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                     messages.push(UnifiedMessage {
                         id: value
                             .get("uuid")
@@ -2528,7 +2540,7 @@ impl ClaudeRecordAccumulator {
                 if let Some((phase, snapshot)) = goal_status_transition(&value) {
                     let transition = PendingGoal {
                         snapshot,
-                        timestamp: parse_timestamp(&value).unwrap_or_else(Utc::now),
+                        timestamp: parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now),
                         record_uuid: value
                             .get("uuid")
                             .and_then(|u| u.as_str())
@@ -2590,7 +2602,7 @@ impl ClaudeRecordAccumulator {
                     // transcript — also covers sessions run through the plain
                     // `claude` CLI, which writes this record but speaks no ACP.
                     "compact_boundary" => {
-                        let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                        let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                         let id = value
                             .get("uuid")
                             .and_then(|u| u.as_str())
@@ -2629,7 +2641,7 @@ impl ClaudeRecordAccumulator {
             }
             "tool_use" => {
                 // Top-level tool_use record (Claude Code JSONL format)
-                let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                 let tool_name = value
                     .get("tool_name")
                     .and_then(|n| n.as_str())
@@ -2773,7 +2785,7 @@ impl ClaudeRecordAccumulator {
                         exit_code: None,
                     });
                 } else {
-                    let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                    let timestamp = parse_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                     messages.push(UnifiedMessage {
                         id: format!("synth-result-{}", messages.len()),
                         role: MessageRole::Assistant,
@@ -2893,7 +2905,8 @@ impl ClaudeParser {
         // and an over-claiming watermark makes the frontend retire background-
         // overlay turns whose content this detail does NOT include — silent
         // loss. An exact length risks at most a transient duplicate.
-        let bytes = fs::read(path)?;
+        let mut bytes = Vec::new();
+        detail_cache::open(path)?.read_to_end(&mut bytes)?;
         let transcript_watermark = bytes.len() as u64;
 
         let mut acc = ClaudeRecordAccumulator::new(path.clone());
@@ -2958,7 +2971,7 @@ impl ClaudeParser {
             folder_path,
             folder_name,
             title,
-            started_at: first_timestamp.unwrap_or_else(Utc::now),
+            started_at: first_timestamp.unwrap_or_else(detail_cache::unversioned_now),
             ended_at: last_timestamp,
             message_count: super::message_turn_count(&turns),
             model,
@@ -3686,7 +3699,7 @@ fn extract_agent_execution_stats(tur: &serde_json::Value) -> AgentExecutionStats
 /// never occupied this session's prompt.
 fn attribute_subagent_usage(session_path: &Path, turns: &mut [MessageTurn]) {
     let subagent_dir = session_path.with_extension("").join("subagents");
-    let Ok(entries) = fs::read_dir(&subagent_dir) else {
+    let Ok(entries) = detail_cache::read_dir(&subagent_dir) else {
         return;
     };
 
@@ -3841,7 +3854,7 @@ pub(crate) type SubagentTranscript = (
 /// it inherited, and everything up to its directive message is dropped from
 /// all five results (see [`is_fork_directive_record`]).
 pub(crate) fn parse_subagent_tool_calls(path: &PathBuf) -> SubagentTranscript {
-    let file = match fs::File::open(path) {
+    let file = match detail_cache::open(path) {
         Ok(f) => f,
         Err(_) => return (Vec::new(), Vec::new(), None, None, None),
     };
@@ -3865,7 +3878,7 @@ pub(crate) fn parse_subagent_tool_calls(path: &PathBuf) -> SubagentTranscript {
     let mut timeline: Vec<AgentTimelineEntry> = Vec::new();
 
     for line in reader.lines() {
-        let line = match line {
+        let line = match line.inspect_err(detail_cache::io_error) {
             Ok(l) => l,
             Err(_) => continue,
         };

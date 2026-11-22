@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -11,6 +10,7 @@ use walkdir::WalkDir;
 use crate::acp::agent_mentions::{contains_only_internal_frames, strip_internal_frames};
 use crate::acp::js_text::is_js_whitespace;
 use crate::models::*;
+use crate::parsers::detail_cache;
 use crate::parsers::codex_async_questions::{self, AsyncQuestionCall, ReplyMessage};
 use crate::parsers::codex_code_mode::{
     extract_chunk_ids, extract_shell_session_ids, is_code_mode_call, parse_code_mode_script,
@@ -211,9 +211,11 @@ impl CodexParser {
     /// The history of the Codex launched with `env`. `session_index.jsonl`
     /// (the thread-name index) is read from the same home.
     pub fn for_env(env: &AgentEnv) -> Self {
-        Self {
-            base_dir: resolve_codex_home_dir_for_env(env).join("sessions"),
-        }
+        Self::at_sessions_dir(resolve_codex_home_dir_for_env(env).join("sessions"))
+    }
+
+    pub(super) fn at_sessions_dir(base_dir: PathBuf) -> Self {
+        Self { base_dir }
     }
 
     /// Test-only constructor that lets callers point the parser at a fixture
@@ -265,8 +267,9 @@ impl CodexParser {
     /// the child's is the one that declares the lineage.
     fn rollout_lines(&self, path: &Path) -> Result<Vec<String>, ParseError> {
         let read = |path: &Path| -> Result<Vec<String>, ParseError> {
-            let own = BufReader::new(fs::File::open(path)?)
+            let own = BufReader::new(detail_cache::open(path)?)
                 .lines()
+                .map(|line| line.inspect_err(detail_cache::io_error))
                 .map_while(Result::ok)
                 .collect();
             Ok(trim_subagent_replay_prefix(own))
@@ -288,7 +291,9 @@ impl CodexParser {
                 );
                 break;
             }
-            let Some(base_path) = self.find_rollout_by_rollout_id(&base_id) else {
+            let base_path = self.find_rollout_by_rollout_id(&base_id);
+            detail_cache::selected_inherited(&base_id, base_path.as_deref());
+            let Some(base_path) = base_path else {
                 tracing::debug!(
                     rollout_id = %base_id,
                     "[codex] rollout inherits from a rollout with no file here"
@@ -351,7 +356,7 @@ impl CodexParser {
     /// name encodes, never a substring: a revert's new file carries the thread
     /// id too, and a pointer to the thread's original rollout must not resolve
     /// to the file holding the pointer.
-    fn find_rollout_by_rollout_id(&self, rollout_id: &str) -> Option<PathBuf> {
+    pub(super) fn find_rollout_by_rollout_id(&self, rollout_id: &str) -> Option<PathBuf> {
         self.rollout_paths().find(|path| {
             RolloutFileName::parse(path).is_some_and(|name| name.rollout_id == rollout_id)
         })
@@ -378,6 +383,26 @@ impl CodexParser {
             .map(|(_, path)| path)
     }
 
+    pub(super) fn conversation_path(&self, conversation_id: &str) -> Option<PathBuf> {
+        // A conversation id is a thread id, read from the rollout the thread
+        // currently uses. One that names no rollout's thread — a summary that
+        // fell back to its file stem — still finds its file by name.
+        self.find_current_rollout(conversation_id).or_else(|| {
+            WalkDir::new(&self.base_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .map(walkdir::DirEntry::into_path)
+                .find(|path| {
+                    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                        && path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .contains(conversation_id)
+                })
+        })
+    }
+
     /// Load Codex's append-only session title index. The transcript remains the
     /// fallback source, so a missing/unreadable index or a malformed line is
     /// deliberately ignored. Later non-empty records for the same session win.
@@ -386,14 +411,17 @@ impl CodexParser {
         let Some(home_dir) = self.base_dir.parent() else {
             return titles;
         };
-        let Ok(file) = fs::File::open(home_dir.join("session_index.jsonl")) else {
+        let Ok(file) = detail_cache::open(&home_dir.join("session_index.jsonl")) else {
             return titles;
         };
 
         for line in BufReader::new(file).lines() {
             let line = match line {
                 Ok(line) => line,
-                Err(_) => break,
+                Err(err) => {
+                    detail_cache::io_error(&err);
+                    break;
+                }
             };
             if line.trim().is_empty() {
                 continue;
@@ -928,29 +956,14 @@ impl AgentParser for CodexParser {
             ));
         }
 
-        // A conversation id is a thread id, read from the rollout the thread
-        // currently uses. One that names no rollout's thread — a summary that
-        // fell back to its file stem — still finds its file by name.
-        let path = self.find_current_rollout(conversation_id).or_else(|| {
-            WalkDir::new(&self.base_dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .map(walkdir::DirEntry::into_path)
-                .find(|path| {
-                    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                        && path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .contains(conversation_id)
-                })
-        });
+        let path = self.conversation_path(conversation_id);
         let Some(path) = path else {
             return Err(ParseError::ConversationNotFound(
                 conversation_id.to_string(),
             ));
         };
 
+        detail_cache::selected_main(&path);
         let mut detail = self.parse_conversation_detail(&path, conversation_id)?;
         if let Some(title) = self.load_thread_name_index().get(conversation_id) {
             detail.summary.title = Some(title.clone());
@@ -3002,10 +3015,11 @@ fn parse_codex_subagent_stats(
     // back to files whose stem ends with the agent_id. Collect and sort
     // candidates to ensure deterministic selection across platforms.
     let exact_path = session_dir.join(format!("agent-{}.jsonl", agent_id));
+    detail_cache::observe(&exact_path);
     let session_file = if exact_path.is_file() {
         exact_path
     } else {
-        let mut candidates: Vec<_> = fs::read_dir(session_dir)
+        let mut candidates: Vec<_> = detail_cache::read_dir(session_dir)
             .ok()?
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
@@ -3030,7 +3044,7 @@ fn parse_codex_subagent_stats(
         candidates.into_iter().next()?
     };
 
-    let file = fs::File::open(&session_file).ok()?;
+    let file = detail_cache::open(&session_file).ok()?;
     let reader = BufReader::new(file);
 
     let mut tool_calls = Vec::new();
@@ -3041,7 +3055,11 @@ fn parse_codex_subagent_stats(
     let mut last_ts: Option<DateTime<Utc>> = None;
     let mut checked_header = false;
 
-    for line in reader.lines().map_while(Result::ok) {
+    for line in reader
+        .lines()
+        .map(|line| line.inspect_err(detail_cache::io_error))
+        .map_while(Result::ok)
+    {
         if line.trim().is_empty() {
             continue;
         }
@@ -3556,7 +3574,7 @@ impl CodexParser {
                         let payload_type =
                             payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-                        let timestamp = parse_codex_timestamp(&value).unwrap_or_else(Utc::now);
+                        let timestamp = parse_codex_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
 
                         // A new reasoning section keeps the run open; `token_count`
                         // is metadata with no visible message and never splits one.
@@ -4210,7 +4228,7 @@ impl CodexParser {
                     if let Some(payload) = value.get("payload") {
                         let payload_type =
                             payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        let timestamp = parse_codex_timestamp(&value).unwrap_or_else(Utc::now);
+                        let timestamp = parse_codex_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
 
                         // A `reasoning` item joins the open run (handled in its arm).
                         // Any other response item closes it — emit the reasoning
@@ -5249,7 +5267,7 @@ impl CodexParser {
                 // the one every codex version writes, once per compaction (521 of
                 // 521 across the local corpus, 0.104 – 0.156).
                 "compacted" => {
-                    let timestamp = parse_codex_timestamp(&value).unwrap_or_else(Utc::now);
+                    let timestamp = parse_codex_timestamp(&value).unwrap_or_else(detail_cache::unversioned_now);
                     // Whatever the reasoning run still holds came before.
                     flush_pending_reasoning(
                         &mut messages,
@@ -5509,7 +5527,7 @@ impl CodexParser {
                             text: format!("/goal {objective}"),
                         }],
                         // Earliest event time so it sorts ahead of the goal card.
-                        timestamp: first_timestamp.unwrap_or_else(Utc::now),
+                        timestamp: first_timestamp.unwrap_or_else(detail_cache::unversioned_now),
                         usage: None,
                         duration_ms: None,
                         model: None,
@@ -5558,7 +5576,7 @@ impl CodexParser {
             folder_path,
             folder_name,
             title,
-            started_at: first_timestamp.unwrap_or_else(Utc::now),
+            started_at: first_timestamp.unwrap_or_else(detail_cache::unversioned_now),
             ended_at: last_timestamp,
             message_count: super::message_turn_count(&turns),
             model,
@@ -5990,7 +6008,7 @@ fn flush_pending_reasoning(
         .join("\n\n");
     grouped.clear();
     pending.clear();
-    let timestamp = ts.unwrap_or_else(Utc::now);
+    let timestamp = ts.unwrap_or_else(detail_cache::unversioned_now);
     messages.push(UnifiedMessage {
         id: format!("thinking-{}", messages.len()),
         role: MessageRole::Assistant,
