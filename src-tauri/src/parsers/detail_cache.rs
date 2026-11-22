@@ -95,7 +95,7 @@ impl Drop for Lease<'_> {
     fn drop(&mut self) {
         let mut store = self.cache.lock();
         store.busy.remove(&self.key);
-        // Also wakes waiters on error or unwind. They retry through get().
+        // Also release waiters when the loader fails or unwinds.
         let _ = self.flight.set(self.result.take());
     }
 }
@@ -121,7 +121,12 @@ impl DetailCache {
             let mut store = self.lock();
             if let Some(pending) = store.busy.get(&key).cloned() {
                 drop(store);
-                if let Some(parsed) = pending.wait().as_ref().filter(|p| p.sources.current(&key)) {
+                let Some(parsed) = pending.wait() else {
+                    // An unstable source, an error or an interrupted read has no
+                    // snapshot to share. Each waiter can now read independently.
+                    return parse().map(Arc::new);
+                };
+                if parsed.sources.current(&key) {
                     return Ok(parsed.detail.clone());
                 }
                 continue;
@@ -217,3 +222,64 @@ impl DetailCache {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn unversioned_waiters_parse_in_parallel_after_the_leader_finishes() {
+    use std::fs;
+    use std::sync::{mpsc, Condvar};
+    use std::time::Duration;
+
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("projects/demo");
+    fs::create_dir_all(&project).unwrap();
+    // Missing timestamps force the parser to consult the wall clock.
+    fs::write(
+        project.join("active.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+    )
+    .unwrap();
+    let env = AgentEnv::with_overrides(&[("CLAUDE_CONFIG_DIR", home.path().to_str().unwrap())]);
+    let key = Key::new(AgentType::ClaudeCode, &env, "active").unwrap();
+    let cache = DetailCache::new(CACHE_BYTES);
+    let parse = || build_agent_parser(key.agent, &env).get_conversation("active");
+    let timeout = Duration::from_secs(5);
+    let (started, entered) = mpsc::channel();
+    let followers = (Mutex::new(0), Condvar::new());
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            cache.get(key.clone(), || {
+                started.send(()).unwrap();
+                let deadline = Instant::now() + timeout;
+                // Map, leader and two waiting readers each own the flight.
+                while Arc::strong_count(cache.lock().busy.get(&key).unwrap()) < 4 {
+                    assert!(Instant::now() < deadline, "readers did not join the flight");
+                    std::thread::yield_now();
+                }
+                parse()
+            })
+            .unwrap()
+        });
+        entered.recv_timeout(timeout).unwrap();
+        for _ in 0..2 {
+            scope.spawn(|| {
+                cache.get(key.clone(), || {
+                    let mut count = followers.0.lock().unwrap();
+                    *count += 1;
+                    followers.1.notify_all();
+                    let (count, _) = followers
+                        .1
+                        .wait_timeout_while(count, timeout, |count| *count < 2)
+                        .unwrap();
+                    let simultaneous = *count == 2;
+                    drop(count);
+                    assert!(simultaneous, "unversioned reads were serialized");
+                    parse()
+                })
+                .unwrap()
+            });
+        }
+    });
+    assert!(cache.lock().ready.is_empty());
+}

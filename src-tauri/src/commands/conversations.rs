@@ -1364,7 +1364,10 @@ fn delegation_result_ids(
     children: &[DbConversationSummary],
 ) -> HashMap<String, String> {
     let mut task_id_by_call: HashMap<String, String> = HashMap::new();
-    if children.iter().any(|child| child.delegation_call_id.is_some()) {
+    if children
+        .iter()
+        .any(|child| child.delegation_call_id.is_some())
+    {
         for turn in turns.iter() {
             for block in turn.blocks.iter() {
                 if let ContentBlock::ToolResult {
@@ -1608,7 +1611,11 @@ impl FolderHistory {
             Some(transcript) => match Arc::try_unwrap(transcript) {
                 Ok(mut detail) => {
                     detail.turns.drain(..offset);
-                    (detail.turns, detail.session_stats, detail.transcript_watermark)
+                    (
+                        detail.turns,
+                        detail.session_stats,
+                        detail.transcript_watermark,
+                    )
                 }
                 Err(shared) => (
                     shared.turns[offset..].to_vec(),
@@ -2210,7 +2217,9 @@ pub async fn get_folder_conversation_turns_core(
     before_index: usize,
     limit: usize,
 ) -> Result<ConversationTurnsPage, AppCommandError> {
-    Ok(load_folder_history(conn, conversation_id).await?.page(before_index, limit))
+    Ok(load_folder_history(conn, conversation_id)
+        .await?
+        .page(before_index, limit))
 }
 
 /// The message navigator's outline of the history above a loaded window:
@@ -2223,7 +2232,9 @@ pub async fn get_folder_conversation_outline_core(
     conversation_id: i32,
     before_index: usize,
 ) -> Result<ConversationOutline, AppCommandError> {
-    Ok(load_folder_history(conn, conversation_id).await?.outline(before_index))
+    Ok(load_folder_history(conn, conversation_id)
+        .await?
+        .outline(before_index))
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -5060,11 +5071,17 @@ mod tests {
             .await
             .expect("load history before approval");
         let approval = |turns: &[MessageTurn]| {
-            turns.iter().flat_map(|t| &t.blocks).find_map(|block| match block {
-                ContentBlock::ToolUse { tool_use_id: Some(id), meta: Some(meta), .. }
-                    if id == "toolu_commit" => meta.get(APPROVAL_META_KEY).cloned(),
-                _ => None,
-            })
+            turns
+                .iter()
+                .flat_map(|t| &t.blocks)
+                .find_map(|block| match block {
+                    ContentBlock::ToolUse {
+                        tool_use_id: Some(id),
+                        meta: Some(meta),
+                        ..
+                    } if id == "toolu_commit" => meta.get(APPROVAL_META_KEY).cloned(),
+                    _ => None,
+                })
         };
         assert!(approval(&page.turns).is_none());
         tool_approval_service::record(
@@ -7787,7 +7804,9 @@ mod tests {
         let mut child = summary_child(42, "other-wire-id", "completed");
         child.delegation_call_id = Some("task-42".into());
         history.children.push(child);
-        history.approvals.push(approval_record("native-call", "allow_once"));
+        history
+            .approvals
+            .push(approval_record("native-call", "allow_once"));
 
         let page = history.page(1, 1);
         assert_eq!(page.turns.len(), 1);
@@ -7865,12 +7884,14 @@ mod tests {
 
     #[test]
     fn apply_turn_window_from_index_is_exact_and_full_coverage_is_marked() {
-        let detail = parsed_history(four_turns()).into_detail(Some(TurnWindowReq::FromIndex(3)), None);
+        let detail =
+            parsed_history(four_turns()).into_detail(Some(TurnWindowReq::FromIndex(3)), None);
         // Index 3 is an assistant turn — fromIndex must NOT round-align.
         assert_eq!(detail.turns_offset, Some(3));
         assert_eq!(detail.turns.len(), 1);
 
-        let full = parsed_history(four_turns()).into_detail(Some(TurnWindowReq::FromIndex(0)), None);
+        let full =
+            parsed_history(four_turns()).into_detail(Some(TurnWindowReq::FromIndex(0)), None);
         assert_eq!(full.turns_offset, Some(0));
         assert_eq!(full.turns.len(), 4);
         assert_eq!(full.uncovered_prefix_max_ts, None);
@@ -7879,7 +7900,8 @@ mod tests {
 
     #[test]
     fn apply_turn_window_from_index_past_total_yields_empty_window() {
-        let detail = parsed_history(four_turns()).into_detail(Some(TurnWindowReq::FromIndex(99)), None);
+        let detail =
+            parsed_history(four_turns()).into_detail(Some(TurnWindowReq::FromIndex(99)), None);
         assert_eq!(detail.turns_offset, Some(4));
         assert_eq!(detail.turns_total, Some(4));
         assert!(detail.turns.is_empty());
