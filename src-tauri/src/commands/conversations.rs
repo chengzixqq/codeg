@@ -18,7 +18,7 @@ use crate::models::*;
 // Concrete parser type only for `load_thread_name_index`, which is codex's own
 // index reader and not part of the `AgentParser` trait. Every history read goes
 // through `build_agent_parser`.
-use crate::parsers::codex::CodexParser;
+use crate::parsers::codex::{CodexParser, CodexText};
 use crate::parsers::{
     build_agent_parser, folder_name_from_path, normalize_path_for_matching, path_eq_for_matching,
     shared_conversation_detail, AgentEnvs, AgentParser, ParseError,
@@ -1657,7 +1657,15 @@ pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
-    let history = load_folder_history(conn, conversation_id).await?;
+    get_folder_conversation_with_text(conn, conversation_id, CodexText::Display).await
+}
+
+pub(crate) async fn get_folder_conversation_with_text(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    text: CodexText,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    let history = load_folder_history(conn, conversation_id, text).await?;
     let title = history.parsed_title().map(str::to_owned);
     Ok((history.into_detail(None, None), title))
 }
@@ -1665,6 +1673,7 @@ pub async fn get_folder_conversation_core(
 async fn load_folder_history(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
+    text: CodexText,
 ) -> Result<FolderHistory, AppCommandError> {
     let summary = conversation_service::get_by_id(conn, conversation_id)
         .await
@@ -1692,7 +1701,17 @@ async fn load_folder_history(
         // the default directory codeg's own environment names.
         let agent_env = agent_setting_service::load_agent_env(conn, at).await;
         tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
-            let parse = |id: &str| shared_conversation_detail(at, &agent_env, id);
+            let parse = |id: &str| {
+                // Codex fingerprints the source reply. The shared detail holds
+                // display text, including rendered file citations.
+                if at == AgentType::Codex && text == CodexText::Fork {
+                    crate::parsers::build_agent_parser_with_text(at, &agent_env, text)
+                        .get_conversation(id)
+                        .map(Arc::new)
+                } else {
+                    shared_conversation_detail(at, &agent_env, id)
+                }
+            };
             match parse(&eid) {
                 Ok(d) => {
                     // Claude `/clear` (and similar on-disk id changes) make
@@ -2142,7 +2161,7 @@ pub async fn get_folder_conversation_with_live_core(
     conversation_id: i32,
     window: Option<crate::commands::turn_window::TurnWindowReq>,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    let mut history = load_folder_history(conn, conversation_id).await?;
+    let mut history = load_folder_history(conn, conversation_id, CodexText::Display).await?;
 
     // Per-turn auto-title backfill. The loaded history includes the session
     // file title; adopt it (and broadcast
@@ -2217,7 +2236,7 @@ pub async fn get_folder_conversation_turns_core(
     before_index: usize,
     limit: usize,
 ) -> Result<ConversationTurnsPage, AppCommandError> {
-    Ok(load_folder_history(conn, conversation_id)
+    Ok(load_folder_history(conn, conversation_id, CodexText::Display)
         .await?
         .page(before_index, limit))
 }
@@ -2232,7 +2251,7 @@ pub async fn get_folder_conversation_outline_core(
     conversation_id: i32,
     before_index: usize,
 ) -> Result<ConversationOutline, AppCommandError> {
-    Ok(load_folder_history(conn, conversation_id)
+    Ok(load_folder_history(conn, conversation_id, CodexText::Display)
         .await?
         .outline(before_index))
 }
@@ -5025,6 +5044,93 @@ mod tests {
             .await
             .expect("read by session id");
         assert_eq!(by_id.turns.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_folder_display_and_fork_keep_their_text_in_either_read_order() {
+        use crate::acp::fork::{fingerprint_agent_message, resolve_fork_point};
+        use serde_json::json;
+
+        const RAW: &str = r#"See :codex-file-citation{path="/README.md"}."#;
+        const MEMORY: &str = "<oai-mem-citation>source</oai-mem-citation>";
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let db = fresh_in_memory_db().await;
+        save_agent_env_json(
+            &db,
+            AgentType::Codex,
+            &json!({"CODEX_HOME": home.path()}).to_string(),
+        )
+        .await;
+        let folder = seed_folder(&db, "/repo").await;
+
+        for (session, modes) in [
+            (
+                "display-first",
+                [CodexText::Display, CodexText::Fork, CodexText::Display],
+            ),
+            (
+                "fork-first",
+                [CodexText::Fork, CodexText::Display, CodexText::Fork],
+            ),
+        ] {
+            let records = [
+                json!({"type":"session_meta","payload":{"id":session,"cwd":"/repo"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "id":"msg-native","content":[{"type":"output_text","text":format!("{RAW}{MEMORY}")}]}}),
+            ];
+            let transcript = records
+                .map(|mut record| {
+                    record["timestamp"] = json!("2026-11-24T10:00:00Z");
+                    record.to_string()
+                })
+                .join("\n");
+            std::fs::write(sessions.join(format!("{session}.jsonl")), transcript).unwrap();
+            let cid = create_conversation_core(&db.conn, folder, AgentType::Codex, None)
+                .await
+                .unwrap();
+            conversation_service::bind_external_id(&db.conn, cid, session, &[])
+                .await
+                .unwrap();
+
+            for mode in modes {
+                let turns = match mode {
+                    CodexText::Display => {
+                        get_folder_conversation_turns_core(&db.conn, cid, 1, 1)
+                            .await
+                            .unwrap()
+                            .turns
+                    }
+                    CodexText::Fork => {
+                        get_folder_conversation_with_text(&db.conn, cid, mode)
+                            .await
+                            .unwrap()
+                            .0
+                            .turns
+                    }
+                };
+                assert_eq!(turns.len(), 1);
+                let turn = &turns[0];
+                assert_eq!(turn.id, "turn-0");
+                assert_eq!(turn.agent_message_id.as_deref(), Some("msg-native"));
+                let [ContentBlock::Text { text }] = turn.blocks.as_slice() else {
+                    panic!("unexpected reply blocks: {:?}", turn.blocks);
+                };
+                match mode {
+                    CodexText::Display => {
+                        assert_eq!(text, &format!("See [/README.md](/README.md).{MEMORY}"));
+                    }
+                    CodexText::Fork => {
+                        assert_eq!(text, RAW);
+                        let point = resolve_fork_point(&turns, "turn-0", AgentType::Codex).unwrap();
+                        assert_eq!(point.message_id, "msg-native");
+                        assert_eq!(point.message_fingerprint, Some(fingerprint_agent_message(RAW)));
+                        assert_eq!(point.message_occurrence, Some(1));
+                    }
+                }
+            }
+        }
     }
 
     /// A reopened conversation gets back the approvals its live run showed:
